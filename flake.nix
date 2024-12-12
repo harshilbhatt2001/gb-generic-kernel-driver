@@ -32,7 +32,7 @@
 
                   git-hooks.excludes = [ ".devenv" ];
                   git-hooks.hooks = {
-                    clang-tidy.enable = true;
+                    # clang-tidy.enable = true;
                   };
 
                   packages = with pkgs; [

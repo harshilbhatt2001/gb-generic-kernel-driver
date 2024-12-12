@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/net.h>
 #include <linux/netdevice.h>
+#include <linux/platform_device.h>
 #include <linux/printk.h>
 #include <linux/workqueue.h>
 
@@ -63,7 +64,9 @@
  */
 
 struct gb_device {
-  struct greybus_host_device *gb_hd;
+  struct platform_device *pdev;
+
+  struct gb_host_device *gb_hd;
 
   struct socket *sock;
 
@@ -105,8 +108,6 @@ struct hdlc_greybus_frame {
   u8 payload[];
 } __packed;
 
-static struct gb_device *gb_dev;
-
 /* Module parameters */
 static char *gb_dev_ip = DEFAULT_GREYBUS_DEVICE_IP_ADDRESS;
 static int gb_dev_port = DEFAULT_GREYBUS_DEVICE_PORT;
@@ -119,6 +120,7 @@ MODULE_PARM_DESC(gb_dev_port, "Wi-Fi port of the greybus device");
 /* Function to send a message */
 static int gb_dev_send_message(struct gb_device *dev, const u8 *data,
                                size_t len) {
+  pr_info("GB_DEV: Sending %zu bytes in hex format", len);
   struct msghdr msg_hdr = {0};
   struct kvec iov = {
       .iov_base = (u8 *)data,
@@ -143,16 +145,16 @@ static void hdlc_rx_greybus_frame(struct gb_device *gb_dev, u8 *buf, u16 len) {
   u16 cport_id = le16_to_cpu(gb_frame->cport);
   u16 gb_msg_len = le16_to_cpu(gb_frame->hdr.size);
 
-  pr_debug("Greybus Operation %u type %X cport %u status %u received",
-           gb_frame->hdr.operation_id, gb_frame->hdr.type, cport_id,
-           gb_frame->hdr.result);
+  pr_info("GB_DEV: Greybus Operation %u type %X cport %u status %u received",
+          gb_frame->hdr.operation_id, gb_frame->hdr.type, cport_id,
+          gb_frame->hdr.result);
 
   greybus_data_rcvd(gb_dev->gb_hd, cport_id, (u8 *)&gb_frame->hdr, gb_msg_len);
 }
 
 static void hdlc_rx_dbg_frame(const struct gb_device *gb_dev, const char *buf,
                               u16 len) {
-  pr_debug("GB_DEV Log: %.*s", (int)len, buf);
+  pr_info("GB_DEV: Log: %.*s", (int)len, buf);
 }
 
 /**
@@ -404,6 +406,10 @@ static int gb_message_send(struct gb_host_device *hd, u16 cport,
           "Sending greybus message with Operation %u, Type: %X on Cport %u",
           msg->header->operation_id, msg->header->type, cport);
 
+  pr_info(
+      "GB_DEV: Sending greybus message with Operation %u, Type: %X on Cport %u",
+      msg->header->operation_id, msg->header->type, cport);
+
   if (le16_to_cpu(msg->header->size) > RX_HDLC_PAYLOAD) {
     return -E2BIG;
   }
@@ -450,9 +456,8 @@ static int gb_greybus_init(struct gb_device *gb_dev) {
   int ret;
 
   pr_info("GB_DEV: Creating greybus host device\n");
-  // TODO: Fix this call to gb_hd_create
-  gb_dev->gb_hd =
-      gb_hd_create(&gb_hdlc_driver, NULL, TX_CIRC_BUF_SIZE, GB_MAX_CPORTS);
+  gb_dev->gb_hd = gb_hd_create(&gb_hdlc_driver, &gb_dev->pdev->dev,
+                               TX_CIRC_BUF_SIZE, GB_MAX_CPORTS);
   if (IS_ERR(gb_dev->gb_hd)) {
     pr_err("GB_DEV: Failed to create greybus host device\n");
     return PTR_ERR(gb_dev->gb_hd);
@@ -464,7 +469,7 @@ static int gb_greybus_init(struct gb_device *gb_dev) {
     pr_err("GB_DEV: Failed to add greybus host device\n");
     goto free_gb_hd;
   }
-  // dev_set_drvdata(&gb_dev->gb_hd->dev, gb_dev);
+  dev_set_drvdata(&gb_dev->gb_hd->dev, gb_dev);
 
   return 0;
 free_gb_hd:
@@ -473,20 +478,22 @@ free_gb_hd:
 }
 
 /* Driver probe function */
-static int gb_dev_probe(void) {
+static int gb_dev_probe(struct platform_device *pdev) {
+  struct gb_device *gb_dev;
   struct sockaddr_in addr;
   int ret;
 
-  gb_dev = kzalloc(sizeof(*gb_dev), GFP_KERNEL);
-  if (!gb_dev) {
+  pr_info("GB_DEV: Allocating memory for gb_dev");
+  gb_dev = devm_kzalloc(&pdev->dev, sizeof(*gb_dev), GFP_KERNEL);
+  if (!gb_dev)
     ret = -ENOMEM;
-  }
+  gb_dev->pdev = pdev;
 
   pr_info("GB_DEV: Creating socket");
   ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
                          &gb_dev->sock);
   if (ret)
-    goto free_sock;
+    return ret;
 
   addr.sin_family = AF_INET;
   addr.sin_port = htons(gb_dev_port);
@@ -501,6 +508,7 @@ static int gb_dev_probe(void) {
     goto free_hdlc;
 
   ret = gb_greybus_init(gb_dev);
+  pr_info("GB_DEV: Greybus Initialized ret %d", ret);
   if (ret)
     goto free_greybus;
 
@@ -518,23 +526,63 @@ free_sock:
   return ret;
 }
 
-static void gb_dev_remove(void) {
-  if (gb_dev) {
+static int gb_dev_remove(struct platform_device *pdev) {
+  struct gb_device *gb_dev = platform_get_drvdata(pdev);
 
-    gb_dev_stop_svc(gb_dev);
-    sock_release(gb_dev->sock);
-    gb_greybus_deinit(gb_dev);
-    hdlc_deinit(gb_dev);
-    kfree(gb_dev);
-  }
+  if (!gb_dev)
+    return -EINVAL;
+
+  gb_greybus_deinit(gb_dev);
+  gb_dev_stop_svc(gb_dev);
+  hdlc_deinit(gb_dev);
+  sock_release(gb_dev->sock);
+
+  return 0;
 }
+
+static struct platform_driver gb_platform_driver = {
+    .probe = gb_dev_probe,
+    .remove = gb_dev_remove,
+    .driver =
+        {
+            .name = "gb-device",
+            .owner = THIS_MODULE,
+        },
+};
+
+static struct platform_device *gb_pdev;
 
 static int __init gb_dev_init(void) {
+  int ret;
   pr_info("GB_DEV: Initializing Generic Greybus Device\n");
-  return gb_dev_probe();
+
+  ret = platform_driver_register(&gb_platform_driver);
+  if (ret) {
+    pr_err("GB_DEV: Failed to register platform driver\n");
+    return ret;
+  }
+
+  gb_pdev = platform_device_alloc("gb-device", -1);
+  if (!gb_pdev) {
+    pr_err("GB_DEV: Failed to allocate platform device\n");
+    return -ENOMEM;
+  }
+  ret = platform_device_add(gb_pdev);
+  if (ret) {
+    pr_err("GB_DEV: Failed to add platform device\n");
+    platform_device_put(gb_pdev);
+    return ret;
+  }
+  return 0;
 }
 
-static void __exit gb_dev_exit(void) { gb_dev_remove(); }
+static void __exit gb_dev_exit(void) {
+  if (gb_pdev) {
+    platform_device_unregister(gb_pdev);
+  }
+  platform_driver_unregister(&gb_platform_driver);
+  pr_info("GB_DEV: Exiting Generic Greybus Device\n");
+}
 
 module_init(gb_dev_init);
 module_exit(gb_dev_exit);
