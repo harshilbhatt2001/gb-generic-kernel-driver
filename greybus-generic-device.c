@@ -16,13 +16,21 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/net.h>
-#include <linux/netdevice.h>
 #include <linux/platform_device.h>
 #include <linux/printk.h>
+#include <linux/serdev.h>
+#include <linux/tty.h>
+#include <linux/tty_driver.h>
+#include <linux/tty_port.h>
+#include <linux/usb.h>
+#include <linux/usb/serial.h>
 #include <linux/workqueue.h>
 
-#define DEFAULT_GREYBUS_DEVICE_IP_ADDRESS "192.168.0.103"
-#define DEFAULT_GREYBUS_DEVICE_PORT 4242
+// #define DEFAULT_GREYBUS_DEVICE_IP_ADDRESS "192.168.0.103"
+// #define DEFAULT_GREYBUS_DEVICE_PORT 4242
+#define DEFAULT_GREYBUS_DEVICE_NAME "gb-device"
+#define DEFAULT_GREYBUS_DEVICE_SERIAL_PORT "ttyUSB1"
+#define SERDEV 0
 
 #define RX_HDLC_PAYLOAD 256
 #define CRC_LEN 2
@@ -64,7 +72,7 @@
  */
 
 struct gb_device {
-  struct platform_device *pdev;
+  struct usb_serial_port *port;
 
   struct gb_host_device *gb_hd;
 
@@ -109,36 +117,19 @@ struct hdlc_greybus_frame {
 } __packed;
 
 /* Module parameters */
-static char *gb_dev_ip = DEFAULT_GREYBUS_DEVICE_IP_ADDRESS;
-static int gb_dev_port = DEFAULT_GREYBUS_DEVICE_PORT;
+// static char *gb_dev_ip = DEFAULT_GREYBUS_DEVICE_IP_ADDRESS;
+// static int gb_dev_port = DEFAULT_GREYBUS_DEVICE_PORT;
+static char *gb_dev_name = DEFAULT_GREYBUS_DEVICE_NAME;
+static char *gb_dev_serial_port = DEFAULT_GREYBUS_DEVICE_SERIAL_PORT;
 
-module_param(gb_dev_ip, charp, 0644);
-MODULE_PARM_DESC(gb_dev_ip, "IP address of the greybus device");
-module_param(gb_dev_port, int, 0644);
-MODULE_PARM_DESC(gb_dev_port, "Wi-Fi port of the greybus device");
-
-/* Function to send a message */
-static int gb_dev_send_message(struct gb_device *dev, const u8 *data,
-                               size_t len) {
-  pr_info("GB_DEV: Sending %zu bytes in hex format", len);
-  struct msghdr msg_hdr = {0};
-  struct kvec iov = {
-      .iov_base = (u8 *)data,
-      .iov_len = len,
-  };
-  int ret;
-
-  ret = kernel_sendmsg(dev->sock, &msg_hdr, &iov, 1, len);
-  if (ret < 0) {
-    pr_err("GB_DEV: Failed to send message (%d)\n", ret);
-  } else {
-    pr_info("GB_DEV: Sent %zu bytes in hex format\n", len);
-    print_hex_dump(KERN_INFO, "GB_DEV: Hex Dump: ", DUMP_PREFIX_NONE, 16, 1,
-                   data, len, true);
-  }
-
-  return ret;
-}
+// module_param(gb_dev_ip, charp, 0644);
+// MODULE_PARM_DESC(gb_dev_ip, "IP address of the greybus device");
+// module_param(gb_dev_port, int, 0644);
+// MODULE_PARM_DESC(gb_dev_port, "Wi-Fi port of the greybus device");
+module_param(gb_dev_name, charp, 0644);
+MODULE_PARM_DESC(gb_dev_name, "Name of the greybus device");
+module_param(gb_dev_serial_port, charp, 0644);
+MODULE_PARM_DESC(gb_dev_serial_port, "Serial port of the greybus device");
 
 static void hdlc_rx_greybus_frame(struct gb_device *gb_dev, u8 *buf, u16 len) {
   struct hdlc_greybus_frame *gb_frame = (struct hdlc_greybus_frame *)buf;
@@ -149,12 +140,47 @@ static void hdlc_rx_greybus_frame(struct gb_device *gb_dev, u8 *buf, u16 len) {
           gb_frame->hdr.operation_id, gb_frame->hdr.type, cport_id,
           gb_frame->hdr.result);
 
+  dev_dbg(&gb_dev->port->dev,
+          "Greybus Operation %u type %X cport %u status %u received",
+          gb_frame->hdr.operation_id, gb_frame->hdr.type, cport_id,
+          gb_frame->hdr.result);
+
   greybus_data_rcvd(gb_dev->gb_hd, cport_id, (u8 *)&gb_frame->hdr, gb_msg_len);
 }
 
 static void hdlc_rx_dbg_frame(const struct gb_device *gb_dev, const char *buf,
                               u16 len) {
   pr_info("GB_DEV: Log: %.*s", (int)len, buf);
+  dev_dbg(&gb_dev->port->dev, "Log: %.*s", (int)len, buf);
+}
+
+static int gb_port_write(struct gb_device *gb_dev, const unsigned char *buf,
+                         size_t count) {
+  struct usb_serial_port *port = gb_dev->port;
+  struct urb *urb;
+  int ret;
+
+  // Allocate URB for bulk transfer
+  urb = usb_alloc_urb(0, GFP_KERNEL);
+  if (!urb)
+    return -ENOMEM;
+
+  // Fill the bulk URB
+  usb_fill_bulk_urb(
+      urb, port->serial->dev,
+      usb_sndbulkpipe(port->serial->dev, port->bulk_out_endpointAddress),
+      (void *)buf, count, usb_serial_generic_write_bulk_callback, port);
+
+  // Submit the URB
+  ret = usb_submit_urb(urb, GFP_KERNEL);
+  if (ret) {
+    dev_err(&port->dev, "Failed to submit write URB: %d\n", ret);
+    usb_free_urb(urb);
+    return ret;
+  }
+
+  // URB will be freed in the callback
+  return count;
 }
 
 /**
@@ -172,13 +198,11 @@ static void hdlc_write(struct gb_device *gb_dev) {
   const unsigned char *buf = &gb_dev->tx_circ_buf.buf[tail];
 
   if (count > 0) {
-    int ret = gb_dev_send_message(gb_dev, buf, count);
-    if (ret > 0) {
+    written = gb_port_write(gb_dev, buf, count);
 
-      /* Finish consuming HDLC data */
-      smp_store_release(&gb_dev->tx_circ_buf.tail,
-                        (tail + ret) & (TX_CIRC_BUF_SIZE - 1));
-    }
+    /* Finish consuming HDLC data */
+    smp_store_release(&gb_dev->tx_circ_buf.tail,
+                      (tail + written) & (TX_CIRC_BUF_SIZE - 1));
   }
 }
 
@@ -204,6 +228,7 @@ static void hdlc_append(struct gb_device *gb_dev, u8 value) {
       return;
     }
     pr_warn("GB_DEV: Tx circ buf full");
+    dev_warn(&gb_dev->port->dev, "Tx circ buf full");
     usleep_range(3000, 5000);
   }
 }
@@ -281,8 +306,8 @@ static void hdlc_rx_frame(struct gb_device *gb_dev) {
 
   crc = crc_ccitt(0xffff, gb_dev->rx_buffer, gb_dev->rx_buffer_len);
   if (crc != 0xf0b8) {
-    // dev_warn_ratelimited(&gb_dev->ndev->dev, "CRC failed from %02x: 0x%04x",
-    //                      address, crc);
+    dev_warn_ratelimited(&gb_dev->port->dev, "CRC failed from %02x: 0x%04x",
+                         address, crc);
     return;
   }
 
@@ -302,7 +327,7 @@ static void hdlc_rx_frame(struct gb_device *gb_dev) {
     hdlc_rx_greybus_frame(gb_dev, buf, len);
     break;
   default:
-    // dev_warn_ratelimited(&gb_dev->ndev->dev, "unknown frame %u", address);
+    dev_warn_ratelimited(&gb_dev->port->dev, "unknown frame %u", address);
   }
 }
 
@@ -334,6 +359,7 @@ static size_t hdlc_rx(struct gb_device *gb_dev, const u8 *data, size_t count) {
         gb_dev->rx_buffer_len++;
       } else {
         pr_err("GB_DEV: RX Buffer Overflow");
+        dev_err(&gb_dev->port->dev, "RX Buffer Overflow");
         gb_dev->rx_buffer_len = 0;
       }
     }
@@ -351,7 +377,8 @@ static int hdlc_init(struct gb_device *gb_dev) {
   gb_dev->tx_circ_buf.head = 0;
   gb_dev->tx_circ_buf.tail = 0;
 
-  gb_dev->tx_circ_buf.buf = kmalloc(TX_CIRC_BUF_SIZE, GFP_KERNEL);
+  gb_dev->tx_circ_buf.buf =
+      devm_kzalloc(&gb_dev->port->dev, TX_CIRC_BUF_SIZE, GFP_KERNEL);
   if (!gb_dev->tx_circ_buf.buf)
     return -ENOMEM;
 
@@ -363,7 +390,6 @@ static int hdlc_init(struct gb_device *gb_dev) {
 
 static void hdlc_deinit(struct gb_device *gb_dev) {
   flush_work(&gb_dev->tx_work);
-  kfree(gb_dev->tx_circ_buf.buf);
 }
 
 /**
@@ -381,6 +407,79 @@ static u8 csum8(const u8 *data, size_t size, u8 base) {
     sum += data[i];
 
   return sum;
+}
+
+#if SERDEV
+static size_t gb_tty_receive(struct serdev_device *sd, const u8 *data,
+                             size_t count) {
+  struct gb_device *gb_dev = serdev_device_get_drvdata(sd);
+  return hdlc_rx(gb_dev, data, count);
+}
+
+static void gb_tty_wakeup(struct serdev_device *serdev) {
+  struct gb_device *gb_dev = serdev_device_get_drvdata(serdev);
+  schedule_work(&gb_dev->tx_work);
+}
+
+static struct serdev_device_ops gb_device_ops = {
+    .receive_buf = gb_tty_receive,
+    .write_wakeup = gb_tty_wakeup,
+};
+#endif
+
+static int gb_port_receive(struct usb_serial_port *port,
+                           const unsigned char *buffer, size_t size) {
+  struct gb_device *gb_dev = usb_get_serial_port_data(port);
+  return hdlc_rx(gb_dev, buffer, size);
+}
+
+static void gb_port_write_wakeup(struct usb_serial_port *port) {
+  struct gb_device *gb_dev = usb_get_serial_port_data(port);
+  schedule_work(&gb_dev->tx_work);
+}
+
+static int gb_port_init(struct gb_device *gb_dev) {
+  struct usb_serial_port *port = gb_dev->port;
+  struct ktermios tmp_termios;
+  struct tty_struct *tty;
+  int ret;
+
+  // Get the TTY, required for generic_open
+  tty = tty_port_tty_get(&port->port);
+  if (!tty)
+    return -ENODEV;
+
+  // Set up port parameters
+  tmp_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
+  tmp_termios.c_iflag = IGNBRK | IGNPAR;
+  tmp_termios.c_oflag = 0;
+  tmp_termios.c_lflag = 0;
+
+  // usb_serial_generic_open needs both port and tty
+  ret = usb_serial_generic_open(port, tty);
+  if (ret) {
+    dev_err(&port->dev, "Failed to open port: %d\n", ret);
+    goto put_tty;
+  }
+
+  // set_termios needs an old_termios parameter and flags
+  if (port->serial->type->set_termios) {
+    port->serial->type->set_termios(tty, port, &tmp_termios);
+  }
+
+  // Success
+  tty_kref_put(tty);
+  return 0;
+
+put_tty:
+  tty_kref_put(tty);
+  return ret;
+}
+
+static void gb_port_deinit(struct gb_device *gb_dev) {
+  if (gb_dev->port) {
+    usb_serial_generic_close(gb_dev->port);
+  }
 }
 
 /**
@@ -456,7 +555,7 @@ static int gb_greybus_init(struct gb_device *gb_dev) {
   int ret;
 
   pr_info("GB_DEV: Creating greybus host device\n");
-  gb_dev->gb_hd = gb_hd_create(&gb_hdlc_driver, &gb_dev->pdev->dev,
+  gb_dev->gb_hd = gb_hd_create(&gb_hdlc_driver, &gb_dev->port->dev,
                                TX_CIRC_BUF_SIZE, GB_MAX_CPORTS);
   if (IS_ERR(gb_dev->gb_hd)) {
     pr_err("GB_DEV: Failed to create greybus host device\n");
@@ -477,38 +576,50 @@ free_gb_hd:
   return ret;
 }
 
-/* Driver probe function */
-static int gb_dev_probe(struct platform_device *pdev) {
-  struct gb_device *gb_dev;
-  struct sockaddr_in addr;
+#if SERDEV
+static void gb_serdev_deinit(struct gb_device *gb_dev) {
+  serdev_device_close(gb_dev->sd);
+}
+
+static int gb_serdev_init(struct gb_device *gb_dev) {
   int ret;
 
-  pr_info("GB_DEV: Allocating memory for gb_dev");
-  gb_dev = devm_kzalloc(&pdev->dev, sizeof(*gb_dev), GFP_KERNEL);
+  serdev_device_set_drvdata(gb_dev->sd, gb_dev);
+  serdev_device_set_client_ops(gb_dev->sd, &gb_device_ops);
+  ret = serdev_device_open(gb_dev->sd);
+  if (ret)
+    return dev_err_probe(&gb_dev->sd->dev, ret, "Unable to open serial device");
+
+  serdev_device_set_baudrate(gb_dev->sd, 115200);
+  serdev_device_set_flow_control(gb_dev->sd, false);
+
+  return 0;
+}
+#endif
+
+/* Driver probe function */
+static int gb_dev_probe(struct usb_serial_port *port) {
+  struct gb_device *gb_dev;
+  int ret;
+
+  pr_info("GB_DEV: Probing USB serial device\n");
+
+  gb_dev = devm_kzalloc(&port->dev, sizeof(*gb_dev), GFP_KERNEL);
   if (!gb_dev)
     ret = -ENOMEM;
-  gb_dev->pdev = pdev;
 
-  pr_info("GB_DEV: Creating socket");
-  ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
-                         &gb_dev->sock);
+  gb_dev->port = port;
+  usb_set_serial_port_data(port, gb_dev);
+
+  ret = gb_port_init(gb_dev);
   if (ret)
     return ret;
-
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(gb_dev_port);
-  addr.sin_addr.s_addr = in_aton(gb_dev_ip);
-
-  ret = kernel_connect(gb_dev->sock, (struct sockaddr *)&addr, sizeof(addr), 0);
-  if (ret)
-    goto free_sock;
 
   ret = hdlc_init(gb_dev);
   if (ret)
     goto free_hdlc;
 
   ret = gb_greybus_init(gb_dev);
-  pr_info("GB_DEV: Greybus Initialized ret %d", ret);
   if (ret)
     goto free_greybus;
 
@@ -521,67 +632,72 @@ free_greybus:
   gb_greybus_deinit(gb_dev);
 free_hdlc:
   hdlc_deinit(gb_dev);
-free_sock:
-  sock_release(gb_dev->sock);
+  gb_port_deinit(gb_dev);
   return ret;
 }
 
-static int gb_dev_remove(struct platform_device *pdev) {
-  struct gb_device *gb_dev = platform_get_drvdata(pdev);
+static int gb_dev_disconnect(struct usb_serial_port *port) {
+  struct gb_device *gb_dev = usb_get_serial_port_data(port);
 
   if (!gb_dev)
     return -EINVAL;
 
+  pr_info("GB_DEV: Disconnecting USB serial device\n");
+
   gb_greybus_deinit(gb_dev);
   gb_dev_stop_svc(gb_dev);
   hdlc_deinit(gb_dev);
-  sock_release(gb_dev->sock);
+  gb_port_deinit(gb_dev);
 
   return 0;
 }
 
-static struct platform_driver gb_platform_driver = {
-    .probe = gb_dev_probe,
-    .remove = gb_dev_remove,
+// Common USB-UART bridge chips used with ESP32
+#define CP210X_VENDOR_ID 0x10C4  // Silicon Labs
+#define CP210X_PRODUCT_ID 0xEA60 // CP210x
+#define CH340_VENDOR_ID 0x1A86   // QinHeng
+#define CH340_PRODUCT_ID 0x7523  // CH340
+
+static struct usb_device_id gb_id_table[] = {
+    {USB_DEVICE(CP210X_VENDOR_ID, CP210X_PRODUCT_ID)},
+    {USB_DEVICE(CH340_VENDOR_ID, CH340_PRODUCT_ID)},
+    {}};
+
+static struct usb_serial_driver gb_serial_device = {
     .driver =
         {
-            .name = "gb-device",
             .owner = THIS_MODULE,
+            .name = "gb-esp32",
         },
+    .id_table = gb_id_table,
+    .num_ports = 1,
+    .probe = gb_dev_probe,
+    .disconnect = gb_dev_disconnect,
+    .read_bulk_callback = gb_port_receive,
+    .write_bulk_callback = gb_port_write_wakeup,
+    .port_probe = NULL,
+    .port_remove = NULL,
 };
 
-static struct platform_device *gb_pdev;
+static struct usb_serial_driver *const serial_drivers[] = {&gb_serial_device,
+                                                           NULL};
+
+MODULE_DEVICE_TABLE(usb, gb_id_table);
 
 static int __init gb_dev_init(void) {
   int ret;
-  pr_info("GB_DEV: Initializing Generic Greybus Device\n");
-
-  ret = platform_driver_register(&gb_platform_driver);
+  pr_info("GB_DEV: Registering USB serial driver\n");
+  ret = usb_serial_register_drivers(serial_drivers, "gb-esp32", gb_id_table);
   if (ret) {
-    pr_err("GB_DEV: Failed to register platform driver\n");
-    return ret;
-  }
-
-  gb_pdev = platform_device_alloc("gb-device", -1);
-  if (!gb_pdev) {
-    pr_err("GB_DEV: Failed to allocate platform device\n");
-    return -ENOMEM;
-  }
-  ret = platform_device_add(gb_pdev);
-  if (ret) {
-    pr_err("GB_DEV: Failed to add platform device\n");
-    platform_device_put(gb_pdev);
+    pr_err("GB_DEV: Failed to register USB serial driver\n");
     return ret;
   }
   return 0;
 }
 
 static void __exit gb_dev_exit(void) {
-  if (gb_pdev) {
-    platform_device_unregister(gb_pdev);
-  }
-  platform_driver_unregister(&gb_platform_driver);
-  pr_info("GB_DEV: Exiting Generic Greybus Device\n");
+  pr_info("GB_DEV: Unregistering USB serial driver\n");
+  usb_serial_deregister_drivers(serial_drivers);
 }
 
 module_init(gb_dev_init);
