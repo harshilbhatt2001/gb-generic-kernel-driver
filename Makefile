@@ -1,5 +1,5 @@
 # Prefix all modules with gb-
-gb-device-y := greybus-generic-device.o
+gb-device-y := greybus-generic-device.o greybus-hdlc.o
 
 obj-m += gb-device.o
 
