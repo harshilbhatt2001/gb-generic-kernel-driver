@@ -21,8 +21,8 @@
 #include <linux/printk.h>
 #include <linux/workqueue.h>
 
-#define DEFAULT_GREYBUS_DEVICE_IP_ADDRESS "192.168.0.103"
-#define DEFAULT_GREYBUS_DEVICE_PORT 4242
+#define DEFAULT_GREYBUS_DEVICE_IP_ADDRESS "192.168.0.104"
+#define DEFAULT_GREYBUS_DEVICE_PORT 4444
 
 #define RX_HDLC_PAYLOAD 256
 #define CRC_LEN 2
@@ -488,6 +488,7 @@ static int gb_dev_probe(struct platform_device *pdev) {
   if (!gb_dev)
     ret = -ENOMEM;
   gb_dev->pdev = pdev;
+  platform_set_drvdata(pdev, gb_dev);
 
   pr_info("GB_DEV: Creating socket");
   ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
@@ -550,38 +551,40 @@ static struct platform_driver gb_platform_driver = {
         },
 };
 
-static struct platform_device *gb_pdev;
+static struct platform_device *gb_platform_device;
 
 static int __init gb_dev_init(void) {
   int ret;
-  pr_info("GB_DEV: Initializing Generic Greybus Device\n");
+  pr_info("GB_DEV: Registering driver\n");
 
   ret = platform_driver_register(&gb_platform_driver);
   if (ret) {
-    pr_err("GB_DEV: Failed to register platform driver\n");
     return ret;
   }
 
-  gb_pdev = platform_device_alloc("gb-device", -1);
-  if (!gb_pdev) {
-    pr_err("GB_DEV: Failed to allocate platform device\n");
-    return -ENOMEM;
+  gb_platform_device = platform_device_alloc("gb-device", -1);
+  if (!gb_platform_device) {
+    ret = -ENOMEM;
+    goto unregister_driver;
   }
-  ret = platform_device_add(gb_pdev);
-  if (ret) {
-    pr_err("GB_DEV: Failed to add platform device\n");
-    platform_device_put(gb_pdev);
-    return ret;
-  }
+
+  ret = platform_device_add(gb_platform_device);
+  if (ret)
+    goto put_device;
+
   return 0;
+
+put_device:
+  platform_device_put(gb_platform_device);
+unregister_driver:
+  platform_driver_unregister(&gb_platform_driver);
+  return ret;
 }
 
 static void __exit gb_dev_exit(void) {
-  if (gb_pdev) {
-    platform_device_unregister(gb_pdev);
-  }
-  platform_driver_unregister(&gb_platform_driver);
   pr_info("GB_DEV: Exiting Generic Greybus Device\n");
+  platform_device_unregister(gb_platform_device);
+  platform_driver_unregister(&gb_platform_driver);
 }
 
 module_init(gb_dev_init);
