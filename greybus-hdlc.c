@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/printk.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
 #include <linux/tty_port.h>
@@ -38,11 +39,21 @@ static void hdlc_rx_dbg_frame(const struct gb_device *gb_dev, const char *buf,
 
 static int gb_tty_write(struct gb_device *gb_dev, const unsigned char *buf,
                         size_t count) {
+  int ret;
   struct tty_struct *tty = gb_dev->tty;
   if (!tty || !tty->ops->write)
     return -ENODEV;
 
-  return tty->ops->write(tty, buf, count);
+  ret = tty->ops->write(tty, buf, count);
+  if (ret < 0)
+    pr_err("GB_DEV: Failed to write to tty: %d\n", ret);
+  else {
+    pr_info("GB_DEV: Sent %zu bytes in hex format: ", count);
+    print_hex_dump(KERN_INFO, "GB_DEV: ", DUMP_PREFIX_OFFSET, 16, 1, buf, count,
+                   false);
+  }
+
+  return ret;
 }
 
 /**

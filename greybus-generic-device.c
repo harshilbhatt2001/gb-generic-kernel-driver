@@ -241,8 +241,6 @@ static int __init gb_dev_init(void) {
   if (ret)
     goto put_device;
 
-  pr_info("GB_DEV: Created and added platform device\n");
-
   return 0;
 
 put_device:
