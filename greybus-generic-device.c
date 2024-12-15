@@ -158,7 +158,7 @@ static int gb_dev_probe(struct platform_device *pdev) {
 
   snprintf(device_path, sizeof(device_path), "/dev/%s", gb_dev_serial_port);
   tty = get_tty_device(device_path);
-  if (IS_ERR(tty)) {
+  if (IS_ERR_OR_NULL(tty)) {
     pr_err("GB_DEV: Failed to find TTY device %s: %ld\n", gb_dev_serial_port,
            PTR_ERR(tty));
     // dev_err(&pdev->dev, "Failed to find TTY device %s: %ld\n",
@@ -212,7 +212,7 @@ static int gb_dev_remove(struct platform_device *pdev) {
 
 static struct platform_driver gb_platform_driver = {
     .probe = gb_dev_probe,
-    .remove = gb_dev_remove,
+    .remove = (void *)gb_dev_remove,
     .driver =
         {
             .name = "gb-dev",
