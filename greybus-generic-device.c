@@ -18,6 +18,7 @@
 #include <linux/net.h>
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
+#include <linux/poll.h>
 #include <linux/printk.h>
 #include <linux/workqueue.h>
 
@@ -79,6 +80,10 @@ struct gb_device {
   u16 rx_buffer_len;
   bool rx_in_esc;
   u8 rx_buffer[MAX_RX_HDLC];
+  struct workqueue_struct *rx_wq;
+  struct work_struct rx_work;
+  struct delayed_work poll_work;
+  bool running;
 };
 
 /**
@@ -342,6 +347,55 @@ static size_t hdlc_rx(struct gb_device *gb_dev, const u8 *data, size_t count) {
   return count;
 }
 
+static void gb_dev_rx_work(struct work_struct *work) {
+  struct gb_device *gb_dev = container_of(work, struct gb_device, rx_work);
+  struct msghdr msg = {.msg_flags = MSG_DONTWAIT};
+  struct kvec iov;
+  u8 buffer[RX_HDLC_PAYLOAD];
+  int ret;
+
+  iov.iov_base = buffer;
+  iov.iov_len = sizeof(buffer);
+
+  while (gb_dev->running) {
+    ret =
+        kernel_recvmsg(gb_dev->sock, &msg, &iov, 1, iov.iov_len, msg.msg_flags);
+    if (ret < 0) {
+      if (ret != -EAGAIN)
+        pr_err("GB_DEV: Error receiving data: %d\n", ret);
+      break;
+    }
+
+    if (ret > 0) {
+      pr_info("GB_DEV: Received %d bytes\n", ret);
+      print_hex_dump(KERN_INFO, "GB_DEV: RX Data: ", DUMP_PREFIX_NONE, 16, 1,
+                     buffer, ret, true);
+      hdlc_rx(gb_dev, buffer, ret);
+    }
+  }
+}
+
+static void gb_dev_poll_work(struct work_struct *work) {
+  struct gb_device *gb_dev =
+      container_of(to_delayed_work(work), struct gb_device, poll_work);
+  struct socket *sock = gb_dev->sock;
+  __poll_t mask;
+
+  if (!gb_dev->running)
+    return;
+
+  mask = sock->ops->poll(NULL, sock, NULL);
+
+  if (mask & POLLIN) {
+    /* Data available - schedule rx work */
+    queue_work(gb_dev->rx_wq, &gb_dev->rx_work);
+  }
+
+  /* Reschedule poll */
+  if (gb_dev->running)
+    schedule_delayed_work(&gb_dev->poll_work, HZ / 100); // 10ms
+}
+
 static int hdlc_init(struct gb_device *gb_dev) {
   pr_info("GB_DEV: Initializing HDLC\n");
 
@@ -513,6 +567,18 @@ static int gb_dev_probe(struct platform_device *pdev) {
   if (ret)
     goto free_greybus;
 
+  gb_dev->rx_wq = alloc_workqueue("gb_dev_rx_wq", WQ_HIGHPRI, 0);
+  if (!gb_dev->rx_wq) {
+    ret = -ENOMEM;
+    goto free_greybus;
+  }
+
+  INIT_WORK(&gb_dev->rx_work, gb_dev_rx_work);
+  INIT_DELAYED_WORK(&gb_dev->poll_work, gb_dev_poll_work);
+  gb_dev->running = true;
+
+  /* Start polling */
+  schedule_delayed_work(&gb_dev->poll_work, 0);
   pr_info("GB_DEV: Starting SVC");
   gb_dev_start_svc(gb_dev);
 
@@ -536,6 +602,16 @@ static int gb_dev_remove(struct platform_device *pdev) {
   gb_greybus_deinit(gb_dev);
   gb_dev_stop_svc(gb_dev);
   hdlc_deinit(gb_dev);
+
+  /* Stop polling */
+  gb_dev->running = false;
+  cancel_delayed_work_sync(&gb_dev->poll_work);
+  /* Cancel and destroy workqueue */
+  if (gb_dev->rx_wq) {
+    cancel_work_sync(&gb_dev->rx_work);
+    destroy_workqueue(gb_dev->rx_wq);
+  }
+
   sock_release(gb_dev->sock);
 
   return 0;
